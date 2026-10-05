@@ -28,6 +28,10 @@
 #include "steam/steam_api_common.h"
 #include "steam/isteamugc.h"
 #include "imultiaddonmanager.h"
+#include <mutex>
+
+// See multiaddonmanager.cpp: guards per-client state and every list GetClientAddons reads off the main thread.
+extern std::recursive_mutex g_ClientAddonsMutex;
 
 #ifdef _WIN32
 #define ROOTBIN "/bin/win64/"
@@ -80,9 +84,9 @@ public: //hooks
 	void RefreshAddons(bool bReloadMap = false);
 	void ClearAddons();
 	void ReloadMap();
-	std::string GetCurrentWorkshopMap() { return m_sCurrentWorkshopMap; }
-	void SetCurrentWorkshopMap(const char *pszWorkshopID) { m_sCurrentWorkshopMap = pszWorkshopID; }
-	void ClearCurrentWorkshopMap() { m_sCurrentWorkshopMap.clear(); }
+	std::string GetCurrentWorkshopMap() { std::lock_guard<std::recursive_mutex> lock(g_ClientAddonsMutex); return m_sCurrentWorkshopMap; }
+	void SetCurrentWorkshopMap(const char *pszWorkshopID) { std::lock_guard<std::recursive_mutex> lock(g_ClientAddonsMutex); m_sCurrentWorkshopMap = pszWorkshopID; }
+	void ClearCurrentWorkshopMap() { std::lock_guard<std::recursive_mutex> lock(g_ClientAddonsMutex); m_sCurrentWorkshopMap.clear(); }
 
 	bool HasUGCConnection();
 	void AddClientAddon(const char *pszAddon, uint64 steamID64 = 0, bool bRefresh = false);
