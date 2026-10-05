@@ -90,7 +90,8 @@ public: //hooks
 	void ClearClientAddons(uint64 steamID64 = 0);
 	void GetClientAddons(CUtlVector<std::string> &addons, uint64 steamID64 = 0);
 	void CheckClientAddons(uint64 steamID64);
-	void AddTimedOutClient(uint64 steamID64) { m_TimedOutClients.insert(steamID64); }
+	void AddTimedOutClient(uint64 steamID64);
+	void PruneClientAddons();
 
 public:
 	const char *GetAuthor() override		{ return "xen"; }

@@ -34,6 +34,8 @@
 #include <string>
 #include <sstream>
 #include <fstream>
+#include <mutex>
+#include <vector>
 #include "iserver.h"
 
 #include "tier0/memdbgon.h"
@@ -182,6 +184,15 @@ struct ClientAddonInfo_t
 };
 
 std::unordered_map<uint64, ClientAddonInfo_t> g_ClientAddons;
+
+// Guards g_ClientAddons, m_TimedOutClients and the client addon lists read by GetClientAddons.
+// SendNetMessage is hooked globally on CServerSideClient and CHLTVClient and is not guaranteed to run on
+// the main thread, while ReplyConnection/ClientConnect/GameFrame mutate the same containers. An unguarded
+// unordered_map::operator[] racing with another insert can rehash under a reader and corrupt the heap.
+// Recursive because GetClientAddons is called from functions that already hold it.
+// Never hold this lock while calling into the engine's network functions (original SendNetMessage,
+// ReplyConnection, Disconnect): those may wait on network threads that are themselves blocked on this lock.
+std::recursive_mutex g_ClientAddonsMutex;
 
 CUtlVector<CServerSideClient *> *GetClientList()
 {
@@ -743,6 +754,8 @@ bool MultiAddonManager::HasUGCConnection()
 
 void MultiAddonManager::AddClientAddon(const char *pszAddon, uint64 steamID64, bool bRefresh)
 {
+	std::unique_lock<std::recursive_mutex> lock(g_ClientAddonsMutex);
+
 	if (!steamID64)
 	{
 		if (m_GlobalClientAddons.Find(pszAddon) != -1)
@@ -768,17 +781,22 @@ void MultiAddonManager::AddClientAddon(const char *pszAddon, uint64 steamID64, b
 	
 	if (bRefresh)
 	{
-		CUtlVector<CServerSideClient*> &clients = *GetClientList();
+		auto pClientList = GetClientList();
+		if (!pClientList)
+			return;
+		CUtlVector<CServerSideClient*> &clients = *pClientList;
 		auto pMsg = GetAddonSignonStateMessage(pszAddon);
 		if (!pMsg)
 		{
 			Panic("Failed to create signon state message for %s\n", pszAddon);
 			return;
 		}
+		// Decide under the lock, send after releasing it.
+		std::vector<CServerSideClient *> sendTo;
 		FOR_EACH_VEC(clients, i)
 		{
 			CServerSideClient *pClient = clients[i];
-			if (steamID64 == 0 || pClient->GetClientSteamID().ConvertToUint64() == steamID64)
+			if (pClient && (steamID64 == 0 || pClient->GetClientSteamID().ConvertToUint64() == steamID64))
 			{
 				// Client is already loading, telling them to reload now will actually just disconnect them. ("Received signon %i when at %i\n" in client console)
 				if (pClient->GetSignonState() == SIGNONSTATE_CHANGELEVEL)
@@ -802,7 +820,7 @@ void MultiAddonManager::AddClientAddon(const char *pszAddon, uint64 steamID64, b
 				}
 				clientInfo.currentPendingAddon = addons.Head();
 				
-				pClient->GetNetChannel()->SendNetMessage(pMsg, BUF_RELIABLE);
+				sendTo.push_back(pClient);
 
 				if (steamID64)
 				{
@@ -810,12 +828,19 @@ void MultiAddonManager::AddClientAddon(const char *pszAddon, uint64 steamID64, b
 				}
 			}
 		}
+		lock.unlock();
+
+		for (CServerSideClient *pClient : sendTo)
+			pClient->GetNetChannel()->SendNetMessage(pMsg, BUF_RELIABLE);
+
 		delete pMsg;
 	}
 }
 
 void MultiAddonManager::RemoveClientAddon(const char *pszAddon, uint64 steamID64)
 {
+	std::lock_guard<std::recursive_mutex> lock(g_ClientAddonsMutex);
+
 	if (!steamID64)
 	{
 		m_GlobalClientAddons.FindAndRemove(pszAddon);
@@ -830,6 +855,8 @@ void MultiAddonManager::RemoveClientAddon(const char *pszAddon, uint64 steamID64
 
 void MultiAddonManager::ClearClientAddons(uint64 steamID64)
 {
+	std::lock_guard<std::recursive_mutex> lock(g_ClientAddonsMutex);
+
 	if (!steamID64)
 	{
 		m_GlobalClientAddons.RemoveAll();
@@ -844,6 +871,8 @@ void MultiAddonManager::ClearClientAddons(uint64 steamID64)
 
 void MultiAddonManager::GetClientAddons(CUtlVector<std::string> &addons, uint64 steamID64)
 {
+	std::lock_guard<std::recursive_mutex> lock(g_ClientAddonsMutex);
+
 	addons.RemoveAll();
 	
 	if (!GetCurrentWorkshopMap().empty())
@@ -857,13 +886,57 @@ void MultiAddonManager::GetClientAddons(CUtlVector<std::string> &addons, uint64 
 			addons.AddToTail(m_GlobalClientAddons[i].c_str());
 	}
 	// If we specify a client steamID64, check for the addons exclusive to this client as well.
+	// Lookup only: this is reached from the SendNetMessage hook and must not create entries.
 	if (steamID64)
 	{
-		FOR_EACH_VEC(g_ClientAddons[steamID64].addonsToLoad, i)
+		auto it = g_ClientAddons.find(steamID64);
+		if (it != g_ClientAddons.end())
 		{
-			if (addons.Find(g_ClientAddons[steamID64].addonsToLoad[i].c_str()) == -1)
-				addons.AddToTail(g_ClientAddons[steamID64].addonsToLoad[i].c_str());
+			FOR_EACH_VEC(it->second.addonsToLoad, i)
+			{
+				if (addons.Find(it->second.addonsToLoad[i].c_str()) == -1)
+					addons.AddToTail(it->second.addonsToLoad[i].c_str());
+			}
 		}
+	}
+}
+
+void MultiAddonManager::AddTimedOutClient(uint64 steamID64)
+{
+	std::lock_guard<std::recursive_mutex> lock(g_ClientAddonsMutex);
+	m_TimedOutClients.insert(steamID64);
+}
+
+// g_ClientAddons used to grow forever: every SteamID that ever reached the handshake (including clients that
+// dropped before ClientConnect, which never get a ClientDisconnect) kept an entry. Drop entries that carry no
+// state worth keeping and have been idle longer than any timeout that could still read them.
+void MultiAddonManager::PruneClientAddons()
+{
+	const double flNow = Plat_FloatTime();
+	const bool bCacheForever = mm_cache_clients_with_addons.Get() && mm_cache_clients_duration.Get() == 0.0f;
+
+	double flMaxIdle = 600.0;
+	flMaxIdle = MAX(flMaxIdle, (double)mm_extra_addons_timeout.Get());
+	flMaxIdle = MAX(flMaxIdle, (double)mm_addon_connection_timeout.Get());
+	if (mm_cache_clients_with_addons.Get())
+		flMaxIdle = MAX(flMaxIdle, (double)mm_cache_clients_duration.Get());
+
+	std::lock_guard<std::recursive_mutex> lock(g_ClientAddonsMutex);
+
+	for (auto it = g_ClientAddons.begin(); it != g_ClientAddons.end();)
+	{
+		const ClientAddonInfo_t &info = it->second;
+
+		// Per-client addons are set through the API and must survive until removed through the API.
+		bool bKeep = info.addonsToLoad.Count() > 0
+			|| !info.currentPendingAddon.empty()
+			|| (bCacheForever && info.downloadedAddons.Count() > 0)
+			|| flNow - info.lastActiveTime < flMaxIdle;
+
+		if (bKeep)
+			++it;
+		else
+			it = g_ClientAddons.erase(it);
 	}
 }
 
@@ -935,7 +1008,10 @@ KHook::Return<void> MultiAddonManager::Hook_StartupServer(INetworkServerService 
 	gpGlobals = g_pEngineServer->GetServerGlobals();
 	g_pNetworkGameServer = g_pNetworkServerService->GetIGameServer();
 
-	m_TimedOutClients.clear();
+	{
+		std::lock_guard<std::recursive_mutex> lock(g_ClientAddonsMutex);
+		m_TimedOutClients.clear();
+	}
 
 	// Remove empty paths added when there are 2+ addons, they screw up file writes
 	g_pFullFileSystem->RemoveSearchPath("", "GAME");
@@ -954,13 +1030,24 @@ bool Hook_SendNetMessage(CServerSideClientBase *pClient, const CNetMessage *pDat
 	NetMessageInfo_t *info = pData->GetNetMessage()->GetNetMessageInfo();
 	
 	uint64 steamID64 = pClient->GetClientSteamID().ConvertToUint64();
-	ClientAddonInfo_t &clientInfo = g_ClientAddons[steamID64];
-	
-	// If we are sending a message to the client, that means the client is still active.
-	clientInfo.lastActiveTime = Plat_FloatTime();
 
+	// Hot path: every message to every client (and CSTV) goes through here. Only refresh an existing entry,
+	// never insert, and release the lock before calling the original.
 	if (info->m_MessageId != net_SignonState || !g_pEngineServer->IsDedicatedServer())
+	{
+		{
+			std::lock_guard<std::recursive_mutex> lock(g_ClientAddonsMutex);
+			auto it = g_ClientAddons.find(steamID64);
+			// If we are sending a message to the client, that means the client is still active.
+			if (it != g_ClientAddons.end())
+				it->second.lastActiveTime = Plat_FloatTime();
+		}
 		return pOriginalFunc(pClient, pData, bufType);
+	}
+
+	std::unique_lock<std::recursive_mutex> lock(g_ClientAddonsMutex);
+	ClientAddonInfo_t &clientInfo = g_ClientAddons[steamID64];
+	clientInfo.lastActiveTime = Plat_FloatTime();
 
 	auto pMsg = const_cast<CNetMessage*>(pData)->ToPB<CNETMsg_SignonState>();
 
@@ -986,6 +1073,7 @@ bool Hook_SendNetMessage(CServerSideClientBase *pClient, const CNetMessage *pDat
 			clientInfo.currentPendingAddon = pMsg->addons();
 		}
 		
+		lock.unlock();
 		return pOriginalFunc(pClient, pData, bufType);
 	}
 	FOR_EACH_VEC(clientInfo.downloadedAddons, i)
@@ -996,6 +1084,7 @@ bool Hook_SendNetMessage(CServerSideClientBase *pClient, const CNetMessage *pDat
 	// Check if client has downloaded everything.
 	if (addons.Count() == 0)
 	{
+		lock.unlock();
 		return pOriginalFunc(pClient, pData, bufType);
 	}
 
@@ -1007,6 +1096,7 @@ bool Hook_SendNetMessage(CServerSideClientBase *pClient, const CNetMessage *pDat
 	pMsg->set_addons(addons.Head().c_str());
 	pMsg->set_signon_state(SIGNONSTATE_CHANGELEVEL);
 
+	lock.unlock();
 	return pOriginalFunc(pClient, pData, bufType);
 }
 
@@ -1081,6 +1171,8 @@ KHook::Return<void> MultiAddonManager::Hook_SetPendingHostStateRequest(CHostStat
 
 void MultiAddonManager::CheckClientAddons(uint64 steamID64)
 {
+	std::lock_guard<std::recursive_mutex> lock(g_ClientAddonsMutex);
+
 	ClientAddonInfo_t &clientInfo = g_ClientAddons[steamID64];
 	clientInfo.connectedState = CLIENTCONN_JOINED;
 
@@ -1128,6 +1220,7 @@ KHook::Return<bool> MultiAddonManager::Hook_CanHLTVClientConnect(IServerGameClie
 KHook::Return<void> MultiAddonManager::Hook_ClientDisconnect(IServerGameClients *pThis, CPlayerSlot slot, ENetworkDisconnectionReason reason, const char *pszName, uint64 steamID64, const char *pszNetworkID )
 {
 	// Mark the disconnection time for caching purposes.
+	std::lock_guard<std::recursive_mutex> lock(g_ClientAddonsMutex);
 	g_ClientAddons[steamID64].lastActiveTime = Plat_FloatTime();
 	g_ClientAddons[steamID64].connectedState = CLIENTCONN_NONE;
 
@@ -1138,7 +1231,12 @@ KHook::Return<void> MultiAddonManager::Hook_ClientActive(IServerGameClients *pTh
 {
 	// When the client reaches this stage, they should already have all the necessary addons downloaded, so we can safely remove the downloaded addons list here.
 	if (!mm_cache_clients_with_addons.Get())
-		g_ClientAddons[steamID64].downloadedAddons.RemoveAll();
+	{
+		std::lock_guard<std::recursive_mutex> lock(g_ClientAddonsMutex);
+		auto it = g_ClientAddons.find(steamID64);
+		if (it != g_ClientAddons.end())
+			it->second.downloadedAddons.RemoveAll();
+	}
 
 	return {KHook::Action::Ignore};
 }
@@ -1154,22 +1252,44 @@ KHook::Return<void> MultiAddonManager::Hook_GameFrame(IServerGameDLL *pThis, boo
 		PrintDownloadProgress();
 	}
 
-	if (!m_TimedOutClients.size())
-		return {KHook::Action::Ignore};
-
-	auto pClients = GetClientList();
-
-	FOR_EACH_VEC(*pClients, i)
+	static double s_flNextPrune = 0.0;
+	if (Plat_FloatTime() > s_flNextPrune)
 	{
-		auto pClient = (*pClients)[i];
+		s_flNextPrune = Plat_FloatTime() + 60.0;
+		PruneClientAddons();
+	}
 
-		uint64 steamID64 = pClient->GetClientSteamID().ConvertToUint64();
+	// Collect under the lock, disconnect outside it (Disconnect re-enters our hooks and the network layer).
+	std::vector<std::pair<CServerSideClient *, uint64>> timedOut;
+	{
+		std::lock_guard<std::recursive_mutex> lock(g_ClientAddonsMutex);
 
-		if (m_TimedOutClients.erase(steamID64))
+		if (!m_TimedOutClients.size())
+			return {KHook::Action::Ignore};
+
+		auto pClients = GetClientList();
+		if (!pClients)
+			return {KHook::Action::Ignore};
+
+		FOR_EACH_VEC(*pClients, i)
 		{
-			pClient->Disconnect(NETWORK_DISCONNECT_TIMEDOUT, "Required Workshop addon download was not accepted in time");
-			g_ClientAddons[steamID64].connectedState = CLIENTCONN_NONE;
+			auto pClient = (*pClients)[i];
+			if (!pClient)
+				continue;
+
+			uint64 steamID64 = pClient->GetClientSteamID().ConvertToUint64();
+
+			if (m_TimedOutClients.erase(steamID64))
+				timedOut.emplace_back(pClient, steamID64);
 		}
+	}
+
+	for (auto &[pClient, steamID64] : timedOut)
+	{
+		pClient->Disconnect(NETWORK_DISCONNECT_TIMEDOUT, "Required Workshop addon download was not accepted in time");
+
+		std::lock_guard<std::recursive_mutex> lock(g_ClientAddonsMutex);
+		g_ClientAddons[steamID64].connectedState = CLIENTCONN_NONE;
 	}
 
 	return {KHook::Action::Ignore};
@@ -1196,6 +1316,9 @@ KHook::Return<bool> MultiAddonManager::Hook_FireEvent(IGameEventManager2 *pThis,
 KHook::Return<void> MultiAddonManager::Hook_ReplyConnection(INetworkGameServer *pThis, CServerSideClient *pClient)
 {
 	uint64 steamID64 = pClient->GetClientSteamID().ConvertToUint64();
+
+	std::unique_lock<std::recursive_mutex> lock(g_ClientAddonsMutex);
+
 	// Clear cache if necessary.
 	ClientAddonInfo_t &clientInfo = g_ClientAddons[steamID64];
 	if (mm_cache_clients_with_addons.Get() && mm_cache_clients_duration.Get() != 0 && Plat_FloatTime() - clientInfo.lastActiveTime > mm_cache_clients_duration.Get())
@@ -1255,6 +1378,9 @@ KHook::Return<void> MultiAddonManager::Hook_ReplyConnection(INetworkGameServer *
 
 	if (mm_addon_debug.Get())
 		Message("%s: Sending addons %s to steamID64 %lli\n", __func__, addons->Get(), steamID64);
+
+	// clientInfo must not be touched after this point.
+	lock.unlock();
 
 	m_hookReplyConnection.CallOriginal(pThis, pClient);
 
