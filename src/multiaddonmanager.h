@@ -78,7 +78,7 @@ public: //hooks
 	bool UnmountAddon(const char *pszAddon);
 	bool AddAddon(const char *pszAddon, bool bRefresh = false);
 	bool RemoveAddon(const char *pszAddon, bool bRefresh = false);
-	bool IsAddonMounted(const char *pszAddon, bool bCheckWorkshopMap = false) { return m_MountedAddons.Find(pszAddon) != -1 || (bCheckWorkshopMap && GetCurrentWorkshopMap() == pszAddon);  }
+	bool IsAddonMounted(const char *pszAddon, bool bCheckWorkshopMap = false) { std::lock_guard<std::recursive_mutex> lock(g_ClientAddonsMutex); return m_MountedAddons.Find(pszAddon) != -1 || (bCheckWorkshopMap && GetCurrentWorkshopMap() == pszAddon);  }
 	bool DownloadAddon(const char *pszAddon, bool bImportant = false, bool bForce = false);
 	void PrintDownloadProgress();
 	void RefreshAddons(bool bReloadMap = false);

@@ -200,6 +200,9 @@ std::recursive_mutex g_ClientAddonsMutex;
 // save/swap/restore and hand clients each other's lists (or leave the server string permanently replaced),
 // so the whole swap is serialized. Lock order is ReplyConnection -> ClientAddons, never the reverse, so
 // holding it across the original call cannot deadlock against the SendNetMessage hook.
+// This is the one lock deliberately held across an engine call (the rule above applies to
+// g_ClientAddonsMutex): the swapped string must stay in place for exactly the duration of the original, and
+// the only thing that waits on this lock is another handshake, which the original itself does not wait for.
 std::recursive_mutex g_ReplyConnectionMutex;
 
 CUtlVector<CServerSideClient *> *GetClientList()
@@ -817,6 +820,11 @@ void MultiAddonManager::AddClientAddon(const char *pszAddon, uint64 steamID64, b
 			// Per-client state is keyed by the iterated client, not by the argument (which is 0 for global addons),
 			// and one client being skipped must not stop the refresh for everyone after it.
 			uint64 clientSteamID64 = pClient->GetClientSteamID().ConvertToUint64();
+
+			// Bots, CSTV and free/disconnected slots: no SteamID or no net channel to send on.
+			if (!clientSteamID64 || !pClient->IsConnected() || !pClient->GetNetChannel())
+				continue;
+
 			if (steamID64 == 0 || clientSteamID64 == steamID64)
 			{
 				// Client is already loading, telling them to reload now will actually just disconnect them. ("Received signon %i when at %i\n" in client console)
@@ -1367,7 +1375,12 @@ KHook::Return<void> MultiAddonManager::Hook_ReplyConnection(INetworkGameServer *
 		// No addons to send. This means the list of original addons is empty as well.
 		assert(originalAddons.IsEmpty());
 		clientInfo.currentPendingAddon.clear();
-		return {KHook::Action::Ignore};
+
+		// Run the original here, still under g_ReplyConnectionMutex: returning Ignore would let KHook call it
+		// after the lock is gone, while another handshake may have the server addon string swapped.
+		lock.unlock();
+		m_hookReplyConnection.CallOriginal(pThis, pClient);
+		return {KHook::Action::Supersede};
 	}
 
 	if (clientInfo.connectedState != CLIENTCONN_CONNECTING)
