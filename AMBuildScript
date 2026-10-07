@@ -194,6 +194,11 @@ class MMSPluginConfig(object):
           '-Wno-implicit-int-float-conversion',
           '-Wno-tautological-overlap-compare',
         ]
+      # s2sdk mathlib warnings on newer clang; fatal under -Werror.
+      if cxx.version >= 'clang-16.0':
+        cxx.cxxflags += ['-Wno-array-parameter']
+      if cxx.version >= 'clang-20.0':
+        cxx.cxxflags += ['-Wno-nontrivial-memcall']
 
     elif cxx.like('msvc'):
       if builder.options.debug == '1':
