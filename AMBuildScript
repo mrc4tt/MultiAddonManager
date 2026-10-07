@@ -170,6 +170,8 @@ class MMSPluginConfig(object):
         '-Wno-non-virtual-dtor',
         '-Wno-overloaded-virtual',
         '-Wno-register',
+        '-Wno-narrowing',  # s2sdk mathlib (sse.cpp) uses narrowing initializers
+        '-Wno-unknown-pragmas',  # s2sdk mathlib uses MSVC pragmas; fatal under -Werror
       ]
       if (cxx.version >= 'gcc-4.7' or cxx.family == 'clang'):
         cxx.cxxflags += ['-Wno-delete-non-virtual-dtor']
@@ -303,8 +305,10 @@ class MMSPluginConfig(object):
     return binary
 
 MMSPlugin = MMSPluginConfig()
-MMSPlugin.detectSDKs()
+# configure() must run before detectSDKs(): s2sdk ships its own mathlib AMBuilder, which
+# findSdks() builds with a clone of the compiler, so it needs our C++17 flags/defines already set.
 MMSPlugin.configure()
+MMSPlugin.detectSDKs()
 
 BuildScripts = [
   'AMBuilder',
