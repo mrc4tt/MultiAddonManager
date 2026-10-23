@@ -701,6 +701,13 @@ void MultiAddonManager::ReloadMap()
 {
 	char cmd[MAX_PATH];
 
+	// No map is running (startup or between maps), the next map load picks up the mounted addons anyway
+	if (!GetGlobals())
+	{
+		Message("No map is running, skipping map reload\n");
+		return;
+	}
+
 	// Using the concommand here as g_pEngineServer->ChangeLevel doesn't unmount workshop maps and we wanna be clean.
 	// See Hook_SetPendingHostStateRequest's comment for more details.
 	// Community maps are treated like workshop maps but they should still be loaded using changelevel
