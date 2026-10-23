@@ -21,14 +21,32 @@
 
 #include <ISmmPlugin.h>
 #include <igameevents.h>
+#include "engine2/gamesessionconfiguration.h"
+#include "engine2/igameeventsystem.h"
+#include "engine2/inetworkgameserver.h"
+#include "engine2/inetworkserverservice.h"
+#include "engine2/isource2server.h"
+#include "engine2/ivengineserver2.h"
+#include "engine2/networkgameserverbase.h"
+#include "engine2/serversideclient.h"
 #include "khook.hpp"
-#include "utlqueue.h"
 #include "utlvector.h"
 #include "networksystem/inetworkserializer.h"
 #include "steam/steam_api_common.h"
 #include "steam/isteamugc.h"
+#include "steam/isteamuser.h"
 #include "imultiaddonmanager.h"
 #include <mutex>
+#include <deque>
+#include <vector>
+#include <string>
+#include <set>
+
+#ifdef AMBUILD
+#include "version_gen.h"
+#else
+#include "version_gen_placeholder.h"
+#endif
 
 // See multiaddonmanager.cpp: guards per-client state and every list GetClientAddons reads off the main thread.
 extern std::recursive_mutex g_ClientAddonsMutex;
@@ -41,13 +59,6 @@ extern std::recursive_mutex g_ClientAddonsMutex;
 #define GAMEBIN "/csgo/bin/linuxsteamrt64/"
 #endif
 
-class IGameEventSystem;
-class INetworkGameServer;
-class CNetMessage;
-class CHostStateMgr;
-class CServerSideClientBase;
-class CServerSideClient;
-struct CHostStateRequest;
 
 class MultiAddonManager : public ISmmPlugin, public IMetamodListener, public IMultiAddonManager
 {
@@ -58,7 +69,6 @@ public:
 	bool Unload(char *error, size_t maxlen);
 	void *OnMetamodQuery(const char *iface, int *ret);
 public: //hooks
-	KHook::Return<void> Hook_GameServerSteamAPIActivated(IServerGameDLL *pThis);
 	KHook::Return<void> Hook_StartupServer(INetworkServerService *pThis, const GameSessionConfiguration_t &config, ISource2WorldSession *, const char *);
 	KHook::Return<bool> Hook_ClientConnect(IServerGameClients *pThis, CPlayerSlot slot, const char *pszName, uint64 steamID64, const char *pszNetworkID, bool unk1, CBufferString *pRejectReason);
 	KHook::Return<void> Hook_ClientDisconnect(IServerGameClients *pThis, CPlayerSlot slot, ENetworkDisconnectionReason reason, const char *pszName, uint64 steamID64, const char *pszNetworkID);
@@ -72,7 +82,8 @@ public: //hooks
 	KHook::Return<void> Hook_ReplyConnection(INetworkGameServer *pThis, CServerSideClient *pClient);
 	KHook::Return<uint64> Hook_ScriptGetAddon();
 
-	void ParseCfg();
+	// Returns true if mm_extra_addons was changed, its callback already refreshed addons then
+	bool ParseCfg();
 	void BuildAddonPath(const char *pszAddon, char *buf, size_t len, bool bLegacy);
 	bool MountAddon(const char *pszAddon, bool bAddToTail);
 	bool UnmountAddon(const char *pszAddon);
@@ -98,14 +109,14 @@ public: //hooks
 	void PruneClientAddons();
 
 public:
-	const char *GetAuthor() override		{ return "xen"; }
-	const char *GetName() override			{ return "MultiAddonManager"; }
-	const char *GetDescription() override	{ return "Multi Addon Manager"; }
-	const char *GetURL() override			{ return "https://github.com/Source2ZE/MultiAddonManager"; }
-	const char *GetLicense() override		{ return "GPL v3 License"; }
-	const char *GetVersion() override		{ return MULTIADDONMANAGER_VERSION; }  // defined by the build script
+	const char *GetAuthor() override		{ return PLUGIN_AUTHOR; }
+	const char *GetName() override			{ return PLUGIN_DISPLAY_NAME; }
+	const char *GetDescription() override	{ return PLUGIN_DESCRIPTION; }
+	const char *GetURL() override			{ return PLUGIN_URL; }
+	const char *GetLicense() override		{ return PLUGIN_LICENSE; }
+	const char *GetVersion() override		{ return PLUGIN_FULL_VERSION; }
 	const char *GetDate() override			{ return __DATE__; }
-	const char *GetLogTag() override		{ return "MultiAddonManager"; }
+	const char *GetLogTag() override		{ return PLUGIN_LOGTAG; }
 
 	CUtlVector<std::string> m_ExtraAddons;
 
@@ -117,7 +128,6 @@ public:
 
 private:
 	KHook::Virtual<IServerGameDLL, void, bool, bool, bool> m_hookGameFrame;
-	KHook::Virtual<IServerGameDLL, void> m_hookGameServerSteamAPIActivated;
 	KHook::Virtual<INetworkServerService, void, const GameSessionConfiguration_t &, ISource2WorldSession *, const char *> m_hookStartupServer;
 	KHook::Virtual<IServerGameClients, bool, CPlayerSlot, const char *, uint64, const char *, bool, CBufferString *> m_hookClientConnect;
 	KHook::Virtual<IServerGameClients, bool, int, const CSteamID &, int *> m_hookCanHLTVClientConnect;
@@ -131,9 +141,17 @@ private:
 	KHook::Function<uint64> m_hookScriptGetAddon;
 
 	CUtlVector<PublishedFileId_t> m_ImportantDownloads; // Important addon downloads that will trigger a map reload when finished
-	CUtlQueue<PublishedFileId_t> m_DownloadQueue; // Queue of all addon downloads to print progress
+	struct AddonDownloadInfo_t
+	{
+		PublishedFileId_t addon;
+		bool bImportant;
+		bool bForce;
+	};
+	std::vector<AddonDownloadInfo_t> m_PreSteamLoginDownloads; // Downloads that failed to start because the server wasn't logged on to Steam yet
+	std::deque<PublishedFileId_t> m_DownloadQueue; // Queue of all addon downloads to print progress
 
 	STEAM_GAMESERVER_CALLBACK_MANUAL(MultiAddonManager, OnAddonDownloaded, DownloadItemResult_t, m_CallbackDownloadItemResult);
+	STEAM_GAMESERVER_CALLBACK_MANUAL(MultiAddonManager, OnSteamServersConnected, SteamServersConnected_t, m_CallbackSteamServersConnected);
 	// Used when reloading current map
 	std::string m_sCurrentWorkshopMap;
 
@@ -274,5 +292,9 @@ constexpr const char* g_SteamErrorMessages[] =
 	"User device doesn't have enough battery charge currently to complete the action",
 	"The operation requires a charger to be plugged in, which wasn't present",
 	"Cached credential was invalid - user must reauthenticate",
-	"The phone number provided is a Voice Over IP number"
+	"The phone number provided is a Voice Over IP number",
+	"The data being accessed is not supported by this API",
+	"Reached the maximum size of the family",
+	"The local data for the offline mode cache is insufficient to login",
+	"Retry the operation later",
 };
