@@ -404,7 +404,7 @@ void *MultiAddonManager::OnMetamodQuery(const char *iface, int *ret)
 	return static_cast<IMultiAddonManager*>(&g_MultiAddonManager);
 }
 
-bool MultiAddonManager::ParseCfg()
+void MultiAddonManager::ParseCfg()
 {
 	char szPath[MAX_PATH];
 	V_snprintf(szPath, sizeof(szPath), "%s/csgo/cfg/multiaddonmanager/multiaddonmanager.cfg", Plat_GetGameDirectory());
@@ -413,13 +413,12 @@ bool MultiAddonManager::ParseCfg()
 	if (!cfgFile.is_open())
 	{
 		Panic("Unable to open & execute config at \"%s\"\n", szPath);
-		return false;
+		return;
 	}
 
 	Message("Executing config\n");
 
 	std::string strCommand;
-	bool bChangedAddons = false;
 
 	// ServerCommand only queues to the command buffer which runs much later, so apply cvars/commands immediately
 	while (std::getline(cfgFile, strCommand))
@@ -436,16 +435,6 @@ bool MultiAddonManager::ParseCfg()
 		ConVarRefAbstract cvarRef(pszCommand, true);
 		if (cvarRef.IsValidRef())
 		{
-			// mm_extra_addons's callback calls RefreshAddons, relay that back to StartupServer to skip refreshing twice.
-			// Only set it when the value differs, so an unchanged value still gets refreshed by the caller.
-			if (cvarRef.GetConVarData() == mm_extra_addons.GetConVarData())
-			{
-				if (!V_strcmp(cvarRef.GetString().Get(), args.Arg(1)))
-					continue;
-
-				bChangedAddons = true;
-			}
-
 			cvarRef.SetString(args.Arg(1));
 			continue;
 		}
@@ -457,8 +446,6 @@ bool MultiAddonManager::ParseCfg()
 			cmdRef.Dispatch(ctx, args);
 		}
 	}
-
-	return bChangedAddons;
 }
 
 void MultiAddonManager::BuildAddonPath(const char *pszAddon, char *buf, size_t len, bool bLegacy = false)
@@ -642,8 +629,6 @@ bool MultiAddonManager::DownloadAddon(const char *pszAddon, bool bImportant, boo
 void MultiAddonManager::OnSteamServersConnected(SteamServersConnected_t *pResult)
 {
 	Message("Logged on to Steam\n");
-
-	RefreshAddons();
 
 	if (m_PreSteamLoginDownloads.empty())
 		return;
@@ -1115,8 +1100,7 @@ KHook::Return<void> MultiAddonManager::Hook_StartupServer(INetworkServerService 
 	// This has to be done here to replicate the behavior on clients, where they mount addons in the string order
 	// So if the current map is ID 1 and extra addons are IDs 2 and 3, they would be mounted in that order with ID 3 at the top
 	// Note that the actual map VPK(s) and any sub-maps like team_select will be even higher, but those usually don't contain any assets that concern us
-	if (!ParseCfg())
-		RefreshAddons();
+	RefreshAddons();
 
 	return {KHook::Action::Ignore};
 }
