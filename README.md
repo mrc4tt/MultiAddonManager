@@ -41,3 +41,15 @@ IMultiAddonManager *pInterface = (IMultiAddonManager*)g_SMAPI->MetaFactory(MULTI
 - Download the [latest release package](https://github.com/Source2ZE/MultiAddonManager/releases/latest) for your OS
 - Extract the package contents into `game/csgo` on your server
 - Edit the config file at `game/csgo/cfg/multiaddonmanager/multiaddonmanager.cfg`
+
+## Support
+
+Need help, found a bug, or have a feature idea? Join the Discord support server:
+
+[![Discord](https://img.shields.io/badge/Discord-Join%20the%20server-5865F2?logo=discord&logoColor=white)](https://discord.gg/zuQN3U2ZEh)
+
+- **Questions and setup help:** ask in the support channels on Discord.
+- **Bug reports:** open a [GitHub issue](https://github.com/mrc4tt/MultiAddonManager/issues) with your server log, plugin version and steps to reproduce. Discord is fine for a quick check first.
+- **Feature requests:** post them on Discord or open an [issue](https://github.com/mrc4tt/MultiAddonManager/issues).
+
+Please do not send support requests by direct message. Asking in the public channels means others can help and find the answer later.
