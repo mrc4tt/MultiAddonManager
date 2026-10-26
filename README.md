@@ -29,7 +29,7 @@ A MetaMod plugin that allows you to use multiple workshop addons at once and hav
 - `mm_remove_client_addon <id>` Remove a workshop ID from the global client-only addon list.
 
 ## Usage in other MetaMod plugins
-- Include the [public header](https://github.com/Source2ZE/MultiAddonManager/blob/main/public/imultiaddonmanager.h).
+- Include the [public header](https://github.com/mrc4tt/MultiAddonManager/blob/main/public/imultiaddonmanager.h).
 - Query the interface in `AllPluginsLoaded` like this:
 ```cpp
 IMultiAddonManager *pInterface = (IMultiAddonManager*)g_SMAPI->MetaFactory(MULTIADDONMANAGER_INTERFACE, nullptr, nullptr);
@@ -38,9 +38,21 @@ IMultiAddonManager *pInterface = (IMultiAddonManager*)g_SMAPI->MetaFactory(MULTI
 ## Installation
 
 - Install [Metamod](https://cs2.poggu.me/metamod/installation/)
-- Download the [latest release package](https://github.com/Source2ZE/MultiAddonManager/releases/latest) for your OS
+- Download the package for your server from the [latest release](https://github.com/mrc4tt/MultiAddonManager/releases/latest) (see [Which download?](#which-download) below)
 - Extract the package contents into `game/csgo` on your server
 - Edit the config file at `game/csgo/cfg/multiaddonmanager/multiaddonmanager.cfg`
+
+### Which download?
+
+Every [release](https://github.com/mrc4tt/MultiAddonManager/releases/latest) has three packages:
+
+| Package | For |
+| --- | --- |
+| `MultiAddonManager-<version>-steamrt3.tar.gz` | Linux servers. The CS2 dedicated server runs in Steam Runtime 3 ("sniper"); this build loads there, in Steam Runtime 4 and on any newer distribution. **Take this one if unsure.** |
+| `MultiAddonManager-<version>-steamrt4.tar.gz` | Linux servers that run in Steam Runtime 4. |
+| `MultiAddonManager-<version>-windows.zip` | Windows servers. |
+
+The top of each release lists the exact glibc and libstdc++ every Linux build needs and the distributions it loads on. A build that is too new for the server fails at load time with `version 'GLIBC_2.xx' not found` in the console.
 
 ## Support
 
