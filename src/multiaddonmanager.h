@@ -22,6 +22,7 @@
 #include <ISmmPlugin.h>
 #include <igameevents.h>
 #include "engine2/gamesessionconfiguration.h"
+#include "engine2/iengineservicemgr.h"
 #include "engine2/igameeventsystem.h"
 #include "engine2/inetworkgameserver.h"
 #include "engine2/inetworkserverservice.h"
@@ -79,6 +80,7 @@ public: //hooks
 	KHook::Return<bool> Hook_SendNetMessage_ServerSideClient(CServerSideClientBase *pClient, const CNetMessage *pData, NetChannelBufType_t bufType);
 	KHook::Return<bool> Hook_SendNetMessage_HLTVClient(CServerSideClientBase *pClient, const CNetMessage *pData, NetChannelBufType_t bufType);
 	KHook::Return<void> Hook_SetPendingHostStateRequest(CHostStateMgr *pMgrDoNotUse, CHostStateRequest *pRequest);
+	KHook::Return<void> Hook_SwitchToLoop(IEngineServiceMgr *pThis, const char *pszLoopModeName, KeyValues *pkvLoopOptions, uint32 nId, const char *pszAddonName, bool);
 	KHook::Return<void> Hook_ReplyConnection(CNetworkGameServerBase *pThis, CServerSideClient *pClient);
 	KHook::Return<uint64> Hook_ScriptGetAddon();
 
@@ -135,6 +137,7 @@ private:
 	KHook::Virtual<IGameEventManager2, bool, IGameEvent *, bool> m_hookFireEvent;
 	KHook::Virtual<CServerSideClientBase, bool, const CNetMessage *, NetChannelBufType_t> m_hookSendNetMessage_ServerSideClient;
 	KHook::Virtual<CServerSideClientBase, bool, const CNetMessage *, NetChannelBufType_t> m_hookSendNetMessage_HLTVClient;
+	KHook::Virtual<IEngineServiceMgr, void, const char *, KeyValues *, uint32, const char *, bool> m_hookSwitchToLoop;
 	KHook::Function<void, CHostStateMgr *, CHostStateRequest *> m_hookSetPendingHostStateRequest;
 	KHook::Function<void, CNetworkGameServerBase *, CServerSideClient *> m_hookReplyConnection;
 	KHook::Function<uint64> m_hookScriptGetAddon;
