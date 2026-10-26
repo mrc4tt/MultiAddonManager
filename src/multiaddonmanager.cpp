@@ -118,9 +118,15 @@ CGlobalVars* GetGlobals()
 	return g_pEngineServer->GetServerGlobals();
 }
 
+// Will return null between map end & new map startup, null check if necessary!
+CNetworkGameServerBase* GetNetworkGameServer()
+{
+	return g_pNetworkServerService ? g_pNetworkServerService->GetIGameServer() : nullptr;
+}
+
 typedef bool (FASTCALL *SendNetMessage_t)(CServerSideClientBase *, const CNetMessage*, NetChannelBufType_t);
 typedef void (FASTCALL *HostStateRequest_t)(CHostStateMgr*, CHostStateRequest*);
-typedef void (FASTCALL *ReplyConnection_t)(INetworkGameServer *, CServerSideClient *);
+typedef void (FASTCALL *ReplyConnection_t)(CNetworkGameServerBase *, CServerSideClient *);
 typedef uint64 (FASTCALL *ScriptGetAddon_t)();
 
 // Signatures
@@ -137,11 +143,6 @@ constexpr const char *g_HostStateRequest_Sig = "55 48 89 E5 41 56 41 55 41 54 49
 constexpr const char *g_ReplyConnection_Sig = "55 B9 ? ? ? ? 41 B8 ? ? ? ? 48 89 E5";
 constexpr const char *g_ScriptGetAddon_Sig = "55 48 89 E5 41 55 41 54 48 8D 75 ? 53 48 83 EC ? 48 8D 05 ? ? ? ? 48 C7 45 ? ? ? ? ? 48 C7 45 ? ? ? ? ? 48 8B 38 48 8B 07 FF 90 ? ? ? ? 8B 55";
 #endif
-
-
-// Offsets
-constexpr int g_iServerAddonsOffset = 376;
-constexpr int g_iClientListOffset = 616;
 
 /* 
 The general workflow is defined as follows:
@@ -191,7 +192,7 @@ std::unordered_map<uint64, ClientAddonInfo_t> g_ClientAddons;
 // ReplyConnection, Disconnect): those may wait on network threads that are themselves blocked on this lock.
 std::recursive_mutex g_ClientAddonsMutex;
 
-// Hook_ReplyConnection temporarily swaps the server-wide addon string at pThis + g_iServerAddonsOffset to a
+// Hook_ReplyConnection temporarily swaps the server-wide addon string (pThis->m_szAddonName) to a
 // per-client list around the original call, then restores it. Concurrent handshakes would interleave the
 // save/swap/restore and hand clients each other's lists (or leave the server string permanently replaced),
 // so the whole swap is serialized. Lock order is ReplyConnection -> ClientAddons, never the reverse, so
@@ -201,29 +202,12 @@ std::recursive_mutex g_ClientAddonsMutex;
 // the only thing that waits on this lock is another handshake, which the original itself does not wait for.
 std::recursive_mutex g_ReplyConnectionMutex;
 
-CUtlVector<CServerSideClient *> *GetClientList()
+CUtlVector<CServerSideClientBase *> *GetClientList()
 {
-	if (!g_pNetworkServerService)
+	if (!GetNetworkGameServer())
 		return nullptr;
 
-	return (CUtlVector<CServerSideClient *> *)((char *)g_pNetworkServerService->GetIGameServer() + g_iClientListOffset);
-}
-
-static CServerSideClient *FindClientBySteamID(uint64 steamID64)
-{
-	CUtlVector<CServerSideClient *> *clients = GetClientList();
-	if (!clients)
-		return nullptr;
-
-	CUtlVector<CServerSideClient *> &clientList = *clients;
-	FOR_EACH_VEC(clientList, i)
-	{
-		CServerSideClient *client = clientList[i];
-		if (client && client->GetClientSteamID().ConvertToUint64() == steamID64)
-			return client;
-	}
-
-	return nullptr;
+	return &GetNetworkGameServer()->m_Clients;
 }
 
 CConVar<CUtlString> mm_extra_addons("mm_extra_addons", FCVAR_NONE, "The workshop IDs of extra addons separated by commas, addons will be downloaded (if not present) and mounted", CUtlString(""),
@@ -788,7 +772,8 @@ bool MultiAddonManager::RemoveAddon(const char *pszAddon, bool bRefresh)
 
 CNetMessagePB<CNETMsg_SignonState> *GetAddonSignonStateMessage(const char *pszAddon)
 {
-	if (!GetGlobals())
+	auto pClientList = GetClientList();
+	if (!pClientList || !GetGlobals())
 		return nullptr;
 
 	INetworkMessageInternal *pNetMsg = g_pNetworkMessages->FindNetworkMessagePartial("SignonState");
@@ -796,10 +781,10 @@ CNetMessagePB<CNETMsg_SignonState> *GetAddonSignonStateMessage(const char *pszAd
 	pMsg->set_spawn_count(GetGlobals()->serverCount);
 	pMsg->set_signon_state(SIGNONSTATE_CHANGELEVEL);
 	pMsg->set_addons(pszAddon ? pszAddon : "");
-	pMsg->set_num_server_players(GetClientList()->Count());
-	for (int i = 0; i < GetClientList()->Count(); i++)
+	pMsg->set_num_server_players(pClientList->Count());
+	for (int i = 0; i < pClientList->Count(); i++)
 	{
-		auto client = GetClientList()->Element(i);
+		auto client = pClientList->Element(i);
 
 		char const *szNetworkId = g_pEngineServer->GetPlayerNetworkIDString(client->GetPlayerSlot());
 
@@ -854,7 +839,7 @@ void MultiAddonManager::AddClientAddon(const char *pszAddon, uint64 steamID64, b
 		auto pClientList = GetClientList();
 		if (!pClientList)
 			return;
-		CUtlVector<CServerSideClient*> &clients = *pClientList;
+		CUtlVector<CServerSideClientBase *> &clients = *pClientList;
 		auto pMsg = GetAddonSignonStateMessage(pszAddon);
 		if (!pMsg)
 		{
@@ -862,10 +847,10 @@ void MultiAddonManager::AddClientAddon(const char *pszAddon, uint64 steamID64, b
 			return;
 		}
 		// Decide under the lock, send after releasing it.
-		std::vector<CServerSideClient *> sendTo;
+		std::vector<CServerSideClientBase *> sendTo;
 		FOR_EACH_VEC(clients, i)
 		{
-			CServerSideClient *pClient = clients[i];
+			CServerSideClientBase *pClient = clients[i];
 			if (!pClient)
 				continue;
 
@@ -911,7 +896,7 @@ void MultiAddonManager::AddClientAddon(const char *pszAddon, uint64 steamID64, b
 		}
 		lock.unlock();
 
-		for (CServerSideClient *pClient : sendTo)
+		for (CServerSideClientBase *pClient : sendTo)
 			pClient->GetNetChannel()->SendNetMessage(pMsg, BUF_RELIABLE);
 
 		delete pMsg;
@@ -1340,7 +1325,7 @@ KHook::Return<void> MultiAddonManager::Hook_GameFrame(IServerGameDLL *pThis, boo
 	}
 
 	// Collect under the lock, disconnect outside it (Disconnect re-enters our hooks and the network layer).
-	std::vector<std::pair<CServerSideClient *, uint64>> timedOut;
+	std::vector<std::pair<CServerSideClientBase *, uint64>> timedOut;
 	{
 		std::lock_guard<std::recursive_mutex> lock(g_ClientAddonsMutex);
 
@@ -1393,7 +1378,7 @@ KHook::Return<bool> MultiAddonManager::Hook_FireEvent(IGameEventManager2 *pThis,
 	return {KHook::Action::Ignore};
 }
 
-KHook::Return<void> MultiAddonManager::Hook_ReplyConnection(INetworkGameServer *pThis, CServerSideClient *pClient)
+KHook::Return<void> MultiAddonManager::Hook_ReplyConnection(CNetworkGameServerBase *pThis, CServerSideClient *pClient)
 {
 	uint64 steamID64 = pClient->GetClientSteamID().ConvertToUint64();
 
@@ -1414,8 +1399,7 @@ KHook::Return<void> MultiAddonManager::Hook_ReplyConnection(INetworkGameServer *
 	clientInfo.lastActiveTime = Plat_FloatTime();
 
 	// Server copies the CUtlString from CNetworkGameServer to this client.
-	CUtlString *addons = (CUtlString *)((uintptr_t)pThis + g_iServerAddonsOffset);
-	CUtlString originalAddons = *addons;
+	CUtlString originalAddons = pThis->m_szAddonName;
 
 	// Figure out which addons the client should be loading.
 	CUtlVector<std::string> clientAddons;
@@ -1461,17 +1445,17 @@ KHook::Return<void> MultiAddonManager::Hook_ReplyConnection(INetworkGameServer *
 		clientAddons.Remove(i);
 	}
 	
-	*addons = VectorToString(clientAddons).c_str();
+	pThis->m_szAddonName = VectorToString(clientAddons).c_str();
 
 	if (mm_addon_debug.Get())
-		Message("%s: Sending addons %s to steamID64 %lli\n", __func__, addons->Get(), steamID64);
+		Message("%s: Sending addons %s to steamID64 %lli\n", __func__, pThis->m_szAddonName.Get(), steamID64);
 
 	// clientInfo must not be touched after this point.
 	lock.unlock();
 
 	m_hookReplyConnection.CallOriginal(pThis, pClient);
 
-	*addons = originalAddons;
+	pThis->m_szAddonName = originalAddons;
 
 	return {KHook::Action::Supersede};
 }
