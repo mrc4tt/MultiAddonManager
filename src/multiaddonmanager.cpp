@@ -1096,7 +1096,7 @@ KHook::Return<void> MultiAddonManager::Hook_StartupServer(INetworkServerService 
 
 bool Hook_SendNetMessage(CServerSideClientBase *pClient, const CNetMessage *pData, NetChannelBufType_t bufType, SendNetMessage_t pOriginalFunc)
 {
-	NetMessageInfo_t *info = pData->GetNetMessage()->GetNetMessageInfo();
+	NetMessageInfo_t *info = pData->GetNetMessage();
 	
 	uint64 steamID64 = pClient->GetClientSteamID().ConvertToUint64();
 
